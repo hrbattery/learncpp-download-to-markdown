@@ -1,9 +1,14 @@
 import dataclasses
+import logging
 import os
 import pathlib
 import typing
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+# from markdownify import markdownify as convert_to_markdown
+from markdown_converter import convert_to_markdown
+from pathvalidate import sanitize_filename
+import mdformat
 
 import bs4
 import pdfkit
@@ -12,8 +17,9 @@ import scrapy
 
 @dataclasses.dataclass
 class URL:
-    index: int
     url: str
+    chapter_dirname: str
+    url_index: str
 
 
 class LearncppSpider(scrapy.Spider):
@@ -48,35 +54,50 @@ class LearncppSpider(scrapy.Spider):
             yield scrapy.Request(
                 url=url.url,
                 callback=self.parse,
-                cb_kwargs={"page_index": str(url.index)},
+                cb_kwargs={
+                    "page_index": url.url_index,
+                    "chapter_dirname": url.chapter_dirname
+                },
             )
 
     def parse(
         self,
         response: scrapy.http.response.Response,
-        page_index: int,
+        page_index: str,
+        chapter_dirname: str
     ) -> None:
         # Modify the filename to include the index
         parsed_url = pathlib.Path(response.url)
         filename = f"{page_index}-{parsed_url.parts[-1]}.html"
         self.log(f"Processing HTML for {filename}")
 
+        _dirname = pathlib.Path(self.name, "html", chapter_dirname)
         # Save the HTML file
-        with open(os.path.join(self.name, filename), "wb") as f:
+        if not _dirname.exists():
+            _dirname.mkdir(parents=True, exist_ok=True)
+        self.log(f"Created working directory: {_dirname}")
+
+        with open(_dirname.joinpath(filename), "wb") as f:
             f.write(response.body)
-        self.log(f"Saved HTML file: {filename}")
+        self.log(f"Saved HTML file: {_dirname.joinpath(filename)}")
 
         # Clean the HTML file
-        self.clean(filename)
-        self.log(f"Cleaned HTML for {filename}")
+        self.clean(_dirname.joinpath(filename))
+        self.log(f"Cleaned HTML for {_dirname.joinpath(filename)}")
 
-        # Run convert_to_pdf function in a ThreadPool
-        self.executor.submit(self.convert_to_pdf, filename)
-        self.log(f"Started PDF conversion for {filename}")
+        # Convert html file
+        with open(_dirname.joinpath(filename), "r") as f:
+            html_content = f.read()
 
-    def clean(self, filename: str) -> None:
+            # Run convert_to_pdf function in a ThreadPool
+            # self.executor.submit(self.convert_to_pdf, filename)
+            self.executor.submit(self.convert_to_markdown, html_content, chapter_dirname, filename)
+            # self.convert_to_markdown(html_content, chapter_dirname, filename)
+            self.log(f"Started PDF conversion for {filename}")
+
+    def clean(self, filename: pathlib.Path) -> None:
         # Read the HTML file
-        with open(os.path.join(self.name, filename), "r", encoding="utf-8") as file:
+        with open(str(filename), "r", encoding="utf-8") as file:
             html_content = file.read()
 
         # Parse the HTML content
@@ -113,9 +134,9 @@ class LearncppSpider(scrapy.Spider):
         )
 
         # Save the modified HTML content
-        with open(os.path.join(self.name, filename), "w", encoding="utf-8") as file:
+        with open(str(filename), "w", encoding="utf-8") as file:
             file.write(str(soup))
-        self.log(f"Saved cleaned HTML for {filename}")
+        self.log(f"Saved cleaned HTML for {str(filename)}")
 
     def remove_elements_by_attribute(
         self,
@@ -129,6 +150,29 @@ class LearncppSpider(scrapy.Spider):
             for element in elements:
                 element.decompose()
 
+    def convert_to_markdown(self, content: str, chapter_dirname: str, filename: str) -> None:
+        markdown_filename = pathlib.Path(filename).with_suffix(".md")
+        md_dirname = pathlib.Path(self.name, "md", chapter_dirname)
+        
+        if not md_dirname.exists():
+            md_dirname.mkdir(parents=True, exist_ok=True)
+        self.log(f"Created working directory: {md_dirname}")
+
+        try:
+            md_content = convert_to_markdown(
+                content,
+                autolinks=True,
+                code_language="cpp",
+                heading_style="atx"
+            )
+            formatted_md_content = mdformat.text(md_content)
+            with open(md_dirname.joinpath(markdown_filename), "w", encoding='utf-8') as file:
+                file.write(formatted_md_content)
+        except OSError as e:
+            self.log(f"write file error: {e}", logging.ERROR)
+
+        self.log(f"Converted {filename} to PDF: {markdown_filename}")
+            
     def convert_to_pdf(self, filename: str) -> None:
         # Original file path
         pdf_filename = pathlib.Path(filename).with_suffix(".pdf")
@@ -147,6 +191,8 @@ class LearncppSpider(scrapy.Spider):
             ):
                 # If so, suppress the error
                 pass
+            else:
+                self.log(f"Convert pdf failed: {e}", logging.ERROR)
 
         self.log(f"Converted {filename} to PDF: {pdf_filename}")
 
@@ -160,35 +206,52 @@ class LearncppSpider(scrapy.Spider):
                 )
             ).read()
         except urllib.error.URLError as e:
-            self.log(f"Error accessing the website: {e}")
+            self.log(f"Error accessing the website: {e}", logging.ERROR)
             return []
 
         try:
             soup = bs4.BeautifulSoup(html_content, "html.parser")
 
-            # Find all divs with class "lessontable-row-title"
-            all_divs = soup.find_all("div", class_="lessontable-row-title")
+            # Find all divs with class "lessontable" first, to get header first
+            all_chapter_tables = soup.find_all("div", class_="lessontable")
 
             # List to store the URLs
             fetched_urls = []
+            
+            for chapter in all_chapter_tables:
+                # Calculate chapter folder name
+                header: str = chapter.find_next("div", class_="lessontable-header")
+                
+                chapter_index = header.find_next("a")["name"].replace("Chapter", "")
+                chapter_name = header.find_next("div", class_="lessontable-header-title").text
 
-            # Variable to store indices
-            page_index = 1
+                chapter_dirname = sanitize_filename(f"{chapter_index}-{chapter_name}")
 
-            # Iterate through each div and find all <a> tags inside
-            for div in all_divs:
-                all_a_tags = div.find_all("a")
+                # Iterate each lesson chapter now
+                page_index = 1
 
-                for a_tag in all_a_tags:
-                    # Append the URL to the list
-                    fetched_urls.append(URL(page_index, a_tag["href"]))
+                # Find all divs with class "lessontable-row-title"
+                all_lesson_divs = chapter.find_all("div", class_="lessontable-row-title")
 
-                    # Increment the index
-                    page_index += 1
+                for div in all_lesson_divs:
+                    all_a_tags = div.find_all("a")
+
+                    # Iterate through each div and find all <a> tags inside
+                    for a_tag in all_a_tags:
+                        # Append the URL to the list
+                        parsed_url = URL(
+                            a_tag["href"],
+                            chapter_dirname,
+                            f"{chapter_index}-{page_index}"
+                        )
+                        fetched_urls.append(parsed_url)
+
+                        # Increment the index
+                        page_index += 1
 
             self.log(f"Successfully fetched {len(fetched_urls)} URLs")
             return fetched_urls
 
         except Exception as e:
-            self.log(f"Error parsing HTML content: {e}")
+            self.log(f"Error parsing HTML content: {e}",logging.ERROR)
             return []
