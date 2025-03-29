@@ -89,10 +89,8 @@ class LearncppSpider(scrapy.Spider):
         with open(_dirname.joinpath(filename), "r") as f:
             html_content = f.read()
 
-            # Run convert_to_pdf function in a ThreadPool
-            # self.executor.submit(self.convert_to_pdf, filename)
+            # Run convert_to_markdown function in a ThreadPool
             self.executor.submit(self.convert_to_markdown, html_content, chapter_dirname, filename)
-            # self.convert_to_markdown(html_content, chapter_dirname, filename)
             self.log(f"Started PDF conversion for {filename}")
 
     def clean(self, filename: pathlib.Path) -> None:
